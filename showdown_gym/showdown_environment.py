@@ -9,12 +9,106 @@ from poke_env import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.battle import AbstractBattle
+from poke_env.battle import AbstractBattle, Pokemon, Move
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
+from poke_env.data import to_id_str
+from poke_env.calc import calculate_base_power
+
+from math import floor
 
 from showdown_gym.base_environment import BaseShowdownEnv
+
+# Helper functions ----------------------------------------------------------------------
+
+def stats_estimate(pokemon, stat):
+    stats = pokemon.base_stats
+    level = pokemon.level
+    if(stat == "hp"):
+        return floor(((2 *stats.get("hp") + 31)* level) / 100) + level + 10
+    else:
+        return floor(((2 * stats.get(stat) + 31) * level) / 100) + 5
+
+def effectiveness(target, move):
+    return target.damage_multiplier(move) if hasattr(target, "damage_multiplier") else 1.0
+    
+def damage_fraction(move: Move, user: Pokemon, target, battle):
+    if move.category == "STATUS" or not move.base_power:
+        return 0.0
+    if not target:
+        print("Supprise")
+        return min(1.0, move.base_power / max(1, stats_estimate(target, "hp")))
+    # base multipliers
+    us = f"{battle.player_role}: {user.name}"
+    ta = f"{opponent_side(battle)}: {target.name}"
+    
+    power = calculate_base_power(us, ta, move, battle, False)
+    # power = float(move.base_power or 0.0)
+    if move.n_hit != (1, 1):
+        power = power * ((move.n_hit[0] + move.n_hit[1]) / 2)
+
+    stab = 1.5 if move.type in (getattr(user, "types", []) or []) else 1.0
+    eff = effectiveness(target, move)
+
+    if move.category == "PHYSICAL":
+        atk = stats_estimate(user, "atk")
+        dfn = stats_estimate(target, "def")
+    else:  # "SPECIAL"
+        atk = stats_estimate(user, "spa")
+        dfn = stats_estimate(target, "spd")
+
+    # normalize by target HP
+    max_hp = max(1, stats_estimate(target, "hp"))
+    dmg = (((2 * user.level + 10) / 250.0) * (atk / max(1, dfn)) * power + 2) * stab * eff
+    return min(1.0, dmg / max_hp)
+
+def opponent_side(battle) -> str:
+    return "p2" if battle.player_role == "p1" else "p1"
+
+def health_fraction(team):
+    for mon in team:
+        if not hasattr(mon, "current_hp_fraction"):
+            setattr(mon, "current_hp_fraction", 1.0)
+    return [float(getattr(mon, "current_hp_fraction", 1.0) or 1.0) for mon in team]
+
+
+def resolve(mon_name, known, battle):
+    # Return a pokemon object to undefined mons
+    mon_id = to_id_str(mon_name)
+    for p in known:
+        if to_id_str(getattr(p, "species", "")) == mon_id:
+            return p
+    return battle.get_pokemon(f"{opponent_side(battle)}: {mon_id}")
+
+def matchup_score(user, target):
+        if not user or not target:
+            return 0.0
+
+        # Move-based effectiveness
+        move_off = 1.0
+        move_dff = 1.0
+        if user.moves:
+            move_off = max((effectiveness(target, mv) for mv in user.moves.values()), default=1.0)
+        if target.moves:
+            move_dff = max((effectiveness(user, mv) for mv in target.moves.values()), default=1.0)
+
+        # Type-based effectiveness
+        type_off = 1.0
+        type_dff = 1.0
+        if hasattr(user, "damage_multiplier") and target.types:
+            for t in target.types:
+                type_off *= user.damage_multiplier(t)
+        if hasattr(target, "damage_multiplier") and user.types:
+            for t in user.types:
+                type_dff *= target.damage_multiplier(t)
+
+        # Weighted
+        off = 0.7 * move_off + 0.3 * type_off
+        dff = 0.7 * move_dff + 0.3 * type_dff
+
+        return max(-1.0, min(1.0, (off - dff) / 4.0))
+
 
 
 class ShowdownEnvironment(BaseShowdownEnv):
